@@ -1,6 +1,10 @@
 # AI Resume Screening & Talent Intelligence Platform
 
-**Live demo → https://talent-intelligence-platform-six.vercel.app**
+> **No live deployment.** An earlier demo ran against a Supabase backend that no
+> longer exists. The platform has since been migrated to Neon PostgreSQL and
+> Cloudflare R2 and is verified locally and against a real Neon database, but it
+> has not been redeployed. See [`STATUS.md`](./STATUS.md) for exactly what is and
+> is not proven.
 
 An evidence-first recruitment platform. Every claim it makes about a candidate
 is traceable to the line of the resume it came from.
@@ -90,17 +94,19 @@ PDF handling, AI behaviour, and live HTTP responses.
 ```
 Next.js (App Router) ──► API routes / server components
                               │
-                    ┌─────────┼─────────┐
-                    ▼         ▼         ▼
-              Supabase    Scoring     Groq
-              Postgres    engine    (LLM only)
-              + Storage  (deterministic)
+                ┌─────────────┼─────────────┐
+                ▼             ▼             ▼
+            Neon          Scoring         Groq
+          Postgres        engine       (LLM only)
+        + Cloudflare  (deterministic)
+              R2
 ```
 
 | Layer | Choice | Why |
 |---|---|---|
 | Framework | Next.js 15, React 19, TypeScript | Server components keep secrets server-side by construction |
-| Database | PostgreSQL via Supabase | Row-level security moves authorization below the API |
+| Database | Neon PostgreSQL, serverless driver | Row-level security moves authorization below the API |
+| Object storage | Cloudflare R2, private bucket | Presigned direct upload sidesteps Vercel's 4.5 MB body cap; no egress fees |
 | AI | Groq | Fast inference on a free tier; abstracted behind one service module |
 | Validation | Zod | Model output is schema-validated before it can reach the database |
 | Styling | Tailwind CSS | — |
@@ -117,10 +123,11 @@ app/                    Pages and API routes
 lib/
   ai/                   Groq client, prompts, queue, service layer
   scoring/engine.ts     Deterministic scoring — the core of the product
-  auth/guards.ts        Server-side authorization
-  supabase/             Three client variants (browser / user / service)
+  auth/                 Password hashing, JWT sessions, server-side guards
+  db/                   Pool, transaction-scoped identity, query builder
+  storage/r2.ts         Cloudflare R2 via the S3-compatible API
   resume/pdf.ts         PDF validation and extraction
-supabase/migrations/    Schema (27 tables) and RLS policies
+db/migrations/          Schema (28 tables) and RLS policies
 scripts/                Seed script and test suites
 ```
 
@@ -128,23 +135,20 @@ scripts/                Seed script and test suites
 
 ## Running it yourself
 
-Requires free accounts with Supabase, Groq and Vercel.
+Requires free accounts with Neon, Cloudflare R2, Groq and Vercel.
 
 ```bash
 npm install
 cp .env.example .env.local     # fill in your own values
-npm test                       # 178 assertions
+npm test
 npm run dev
 ```
 
-Apply `supabase/migrations/0001_schema.sql` then `0002_rls.sql` in the Supabase
-SQL editor, then seed:
+Apply `db/migrations/0001_schema.sql` then `0002_rls.sql` against the database,
+then seed:
 
 ```bash
-export SEED_PASSWORD_CANDIDATE='...'
-export SEED_PASSWORD_RECRUITER='...'
-export SEED_PASSWORD_ADMIN='...'
-npx tsx scripts/seed.ts
+npx tsx --conditions=react-server --env-file=.env.local scripts/seed.ts
 ```
 
 Full deployment walkthrough: [`GO-LIVE.md`](./GO-LIVE.md).
