@@ -124,7 +124,8 @@ lib/
   ai/                   Groq client, prompts, queue, service layer
   scoring/engine.ts     Deterministic scoring — the core of the product
   auth/                 Password hashing, JWT sessions, server-side guards
-  db/                   Pool, transaction-scoped identity, query builder
+  db/                   Pool, transaction-scoped identity, query builder,
+                        embedded-select compiler, user/service clients
   storage/r2.ts         Cloudflare R2 via the S3-compatible API
   resume/pdf.ts         PDF validation and extraction
 db/migrations/          Schema (28 tables) and RLS policies
@@ -139,19 +140,31 @@ Requires free accounts with Neon, Cloudflare R2, Groq and Vercel.
 
 ```bash
 npm install
-cp .env.example .env.local     # fill in your own values
-npm test
-npm run dev
 ```
 
-Apply `db/migrations/0001_schema.sql` then `0002_rls.sql` against the database,
-then seed:
+Copy `.env.example` to `.env.local` and fill in your own values, then apply the
+schema and provision the least-privilege application role:
 
 ```bash
-npx tsx --conditions=react-server --env-file=.env.local scripts/seed.ts
+npm run db:migrate && npm run db:setup-role
 ```
 
-Full deployment walkthrough: [`GO-LIVE.md`](./GO-LIVE.md).
+`db:setup-role` matters: Neon's owner role carries `BYPASSRLS`, which switches
+off every RLS policy in the schema. The application must connect as `tip_app`.
+See [`DEPLOY.md`](./DEPLOY.md) section 0.
+
+```bash
+npm test && npm run dev
+```
+
+Seeding, once the database is up (set `SEED_PASSWORD_CANDIDATE`,
+`SEED_PASSWORD_RECRUITER` and `SEED_PASSWORD_ADMIN` in `.env.local` first):
+
+```bash
+npm run seed
+```
+
+Full deployment walkthrough: [`DEPLOY.md`](./DEPLOY.md).
 Honest scope notes, including what is *not* built: [`STATUS.md`](./STATUS.md).
 
 ---
