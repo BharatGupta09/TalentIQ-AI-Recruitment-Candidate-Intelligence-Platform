@@ -1,7 +1,7 @@
 /**
  * Provisions the least-privilege application role.
  *
- *   npx tsx --conditions=react-server --env-file=.env.local scripts/db-setup-role.ts
+ *   npx tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/db-setup-role.ts
  *
  * WHY THIS EXISTS
  * Neon hands you `neondb_owner`, and that role carries the BYPASSRLS
@@ -20,7 +20,7 @@
  *   neondb_owner  -> migrations only (DDL), keeps BYPASSRLS
  *   tip_app       -> the application, NOBYPASSRLS, subject to every policy
  *
- * The generated password is written only into .env.local, which is git-ignored,
+ * The generated password is written only into .dev.vars, which is git-ignored,
  * and is never printed.
  *
  * Re-running is safe: the role is created if absent, its password rotated, and
@@ -28,14 +28,11 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { Client, neonConfig } from '@neondatabase/serverless';
-
-if (typeof globalThis.WebSocket !== 'undefined') {
-  neonConfig.webSocketConstructor = globalThis.WebSocket;
-}
+import { Client } from '@neondatabase/serverless';
+import '../lib/db/neon-config';
 
 const ROLE = 'tip_app';
-const ENV = '.env.local';
+const ENV = '.dev.vars';
 
 /** Alphanumeric only, so it needs no escaping inside a connection URI. */
 function generatePassword(): string {
@@ -131,7 +128,7 @@ async function main() {
     env.DATABASE_URL = withRole(env.DATABASE_URL, ROLE, password);
     env.DATABASE_URL_UNPOOLED = withRole(env.DATABASE_URL_UNPOOLED, ROLE, password);
     writeEnv(env);
-    console.log('  .env.local updated: application now connects as the least-privilege role');
+    console.log('  .dev.vars updated: application now connects as the least-privilege role');
     console.log('  DATABASE_URL_OWNER retained for migrations (DDL) only');
   } finally {
     await client.end();

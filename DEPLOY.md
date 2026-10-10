@@ -1,10 +1,15 @@
-# Deployment runbook — Neon + Cloudflare R2 + Groq + Vercel
+# Deployment runbook — Neon + Cloudflare Workers (+ optional R2 and Groq)
 
-Total cost: $0. Every service below is used on its free tier.
+Target: **Neon Free** (PostgreSQL) and **Cloudflare Workers Free** (the Next.js
+app, built with the OpenNext adapter). Cloudflare R2 (resume PDFs) and Groq (AI
+analysis) are optional integrations; everything else works without them.
 
-The application no longer uses Supabase. It talks to PostgreSQL directly over
-the Neon serverless driver, stores resumes in a private R2 bucket via the
-S3-compatible API, and runs as a normal Next.js app on Vercel.
+Commands are the same in PowerShell unless a PowerShell form is shown.
+Local values live in `.dev.vars` (copy `.dev.vars.example`); it is git-ignored
+and never deployed. **Do not put secrets in `.env`, `.env.local` or
+`.env.production`**: the OpenNext build copies those files into the Worker, and
+`npm run cf:build` refuses to run if they hold anything but `NEXT_PUBLIC_*` or
+`GROQ_MODEL`.
 
 ---
 
@@ -19,222 +24,231 @@ LEVEL SECURITY`. An application connected as the owner has all ~100 policies in
 `db/migrations/0002_rls.sql` silently switched off. No error, no warning; every
 user simply sees every row.
 
-This is not hypothetical. It was observed during Phase 3: a recruiter read
-another recruiter's applications while `owns_application()` correctly returned
-`false`, because the policy was never consulted.
-
-The split this repo uses:
-
 | Role | Used for | RLS |
 |---|---|---|
-| `neondb_owner` | migrations and schema maintenance only | bypasses (by design) |
-| `tip_app` | the application runtime | **fully subject to policies** |
+| `neondb_owner` | migrations and schema maintenance only (`DATABASE_URL_OWNER`, local) | bypasses (by design) |
+| `tip_app` | the application runtime (`DATABASE_URL`, Worker secret) | **fully subject to policies** |
 
 `scripts/db-setup-role.ts` provisions `tip_app` with `NOBYPASSRLS`, no
-ownership of any table, and no `CREATE` on the schema — so the application
-cannot alter its own security model. It refuses to finish if the role ends up
-with `BYPASSRLS`.
-
-`DATABASE_URL` in Vercel must be the **`tip_app`** connection string.
-`DATABASE_URL_OWNER` should **not** be set in Vercel at all; it is a local
-migration credential.
+ownership of any table and no `CREATE` on the schema, and refuses to finish if
+the role ends up with `BYPASSRLS`.
 
 ---
 
-## 1. Neon (~5 min)
+## 1. Neon (Free plan)
 
-1. Create a project at neon.tech. Free tier, any region.
-2. From the dashboard, copy both connection strings:
-   - **Pooled** into `DATABASE_URL`
-   - **Direct / unpooled** into `DATABASE_URL_UNPOOLED`
-3. Put the direct one in `.env.local` as `DATABASE_URL_OWNER` as well, then:
+1. Create a project at neon.tech (any region; at the time of writing the Free
+   plan asks for no payment method).
+2. Copy the **direct** (non-pooler) connection string of `neondb_owner` into
+   `.dev.vars` as `DATABASE_URL_UNPOOLED`, and the **pooled** one as
+   `DATABASE_URL`.
+3. Apply the schema, then create the application role:
 
 ```bash
 npm run db:migrate
+npm run db:setup-role
+npm run db:migrate      # safe to repeat: prints "migrations up to date"
 ```
+
+`db:migrate` applies `db/migrations/*.sql` in order, once each, recording them
+in `tip_migrations.applied` (a schema the application role cannot read). A file
+edited after it was applied is refused; add a new numbered migration instead.
+Nothing in it drops or truncates anything. A database set up before the ledger
+existed (0001 and 0002 applied) is recognised and recorded.
+
+`db:setup-role` creates `tip_app`, rewrites `DATABASE_URL` and
+`DATABASE_URL_UNPOOLED` in `.dev.vars` to that role and keeps the owner string
+as `DATABASE_URL_OWNER` for future migrations. It never prints the password.
+Re-running it **rotates** the `tip_app` password, so update the Worker secret
+afterwards.
+
+4. Check, as the owner (Neon SQL editor):
+
+```sql
+select tablename from pg_tables where schemaname = 'public' and rowsecurity = false;  -- zero rows
+select rolbypassrls from pg_roles where rolname = 'tip_app';                         -- f
+```
+
+Driver notes: the app uses `@neondatabase/serverless` over WebSockets, which
+works from Workers without TCP sockets or Hyperdrive. `sslmode=require` and
+`channel_binding=require` may stay in the copied strings. The Free plan scales
+compute to zero after 5 idle minutes; the first request afterwards waits for a
+cold start.
+
+---
+
+## 2. Demo data (optional)
+
+Set `SEED_PASSWORD_CANDIDATE`, `SEED_PASSWORD_RECRUITER` and
+`SEED_PASSWORD_ADMIN` in `.dev.vars` (your own, 12+ characters; the template
+placeholders are refused), then:
 
 ```bash
-npm run db:setup-role
+npm run seed
 ```
 
-`db:migrate` applies `db/migrations/*.sql` as the owner. `db:setup-role` then
-creates `tip_app`, rewrites `DATABASE_URL` and `DATABASE_URL_UNPOOLED` to that
-least-privilege role, and preserves `DATABASE_URL_OWNER` for future migrations.
-It never prints the generated password.
-
-4. Verify RLS is on everywhere — this must return **zero rows**:
-
-```sql
-select tablename from pg_tables
- where schemaname = 'public' and rowsecurity = false;
-```
-
-5. Verify the application role cannot bypass RLS — must return `f`:
-
-```sql
-select rolbypassrls from pg_roles where rolname = 'tip_app';
-```
-
-**Free-tier note:** Neon scales a branch to zero after 5 minutes idle and this
-cannot be disabled on the free plan. The first request after an idle period
-pays a cold start of roughly a second. Open the app once before a demo.
+It creates eight fictional `@demo.internal` accounts, five candidate profiles
+and resumes (text only, no PDF), four roles and nine applications, and queues
+the AI analyses. It is idempotent (a re-run adds nothing and queues nothing
+new) and **refuses any database that has an account outside `@demo.internal`**,
+so it cannot be pointed at a database with real users. Anyone who knows the seed
+passwords can sign in as the demo admin: use your own and share them
+deliberately.
 
 ---
 
-## 2. Cloudflare R2 (~5 min)
+## 3. Groq (optional)
 
-1. Cloudflare dashboard, R2, Create bucket. Name it, e.g.
-   `talent-intelligence-resumes`.
-2. **Keep it private.** Do not enable public access or an r2.dev public domain.
-   Nothing in this codebase ever returns a public object URL; the browser only
-   ever receives presigned URLs with a 5-minute expiry.
-3. R2, Manage API Tokens, Create API Token, **Object Read & Write**, scoped to
-   that single bucket.
-4. Collect four values:
-
-| Variable | Where it comes from |
-|---|---|
-| `R2_ACCOUNT_ID` | R2 overview page (the account id inside the S3 endpoint) |
-| `R2_BUCKET` | the bucket name |
-| `R2_ACCESS_KEY_ID` | from the API token |
-| `R2_SECRET_ACCESS_KEY` | from the API token, shown once |
-
-Server-side access needs no CORS rule, but the browser PUTs directly to the
-presigned URL, so the bucket needs one allowing `PUT` from the deployment
-origin:
-
-```json
-[{ "AllowedOrigins": ["https://YOUR-APP.vercel.app"],
-   "AllowedMethods": ["PUT", "GET"],
-   "AllowedHeaders": ["content-type"],
-   "MaxAgeSeconds": 3000 }]
-```
-
-Direct-to-R2 upload is not an optimisation, it is required. A Vercel function
-caps request bodies at 4.5 MB and the product's resume limit is 5 MB, so
-routing the bytes through the server would reject large resumes.
+console.groq.com, API Keys, Create. `GROQ_API_KEY` is the key; `GROQ_MODEL`
+defaults to `llama-3.3-70b-versatile` (`wrangler.jsonc` vars). The free tier is
+rate-limited, which is why `lib/ai/service.ts` queues work with backoff and
+honours `Retry-After`. **Without a key** the queue cannot run: draining marks a
+job `failed` with "GROQ_API_KEY is not configured" (an admin can retry it later
+from the AI page), and no scores are produced.
 
 ---
 
-## 3. Groq (~2 min)
+## 4. Cloudflare R2 (optional, not verified)
 
-1. console.groq.com, API Keys, Create.
-2. `GROQ_API_KEY` is the key. `GROQ_MODEL` is `llama-3.3-70b-versatile`.
+Only resume PDF **upload** and **viewing** use R2 (`lib/storage/r2.ts`, S3 API
+with presigned URLs). Without the four `R2_*` values those two endpoints answer
+`503 "Resume storage is not configured"`; sign-in, jobs, applications, scoring,
+pipeline, admin and seeded resumes (text) all work.
 
-The free tier is rate-limited, which is why `lib/ai/service.ts` queues work
-with exponential backoff and honours `Retry-After`.
+This integration has **not** been exercised against a real bucket. Cloudflare may
+require R2 to be activated on the account (which can involve billing details)
+before a bucket can be created; check that before relying on it. If you enable
+it: create a private bucket, an "Object Read & Write" API token scoped to it,
+set `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` as
+Worker secrets, and add a CORS rule allowing `PUT`/`GET` with header
+`content-type` from your Worker's origin (the browser uploads straight to the
+presigned URL).
 
 ---
 
-## 4. Secrets you generate yourself
+## 5. Secrets you generate yourself
 
 ```bash
 openssl rand -hex 32
 ```
 
-Run it three times, for `AUTH_JWT_SECRET` (signs session cookies),
-`AI_WORKER_SECRET` (authenticates the queue worker) and `CRON_SECRET`
-(authenticates Vercel Cron).
-
-`AUTH_JWT_SECRET` must be at least 32 characters or the middleware fails closed
-and every protected route redirects to `/login`.
-
----
-
-## 5. Vercel (~5 min)
-
-1. vercel.com, Add New, Project, import the GitHub repository.
-2. Framework preset: Next.js. Leave the build settings at their defaults.
-3. Add these environment variables **before the first deploy**:
-
-| Variable | Value |
-|---|---|
-| `DATABASE_URL` | Neon **pooled** string for **`tip_app`** |
-| `DATABASE_URL_UNPOOLED` | Neon **direct** string for **`tip_app`** |
-| `AUTH_JWT_SECRET` | 32-byte hex |
-| `R2_ACCOUNT_ID` | Cloudflare account id |
-| `R2_BUCKET` | bucket name |
-| `R2_ACCESS_KEY_ID` | R2 token key id |
-| `R2_SECRET_ACCESS_KEY` | R2 token secret |
-| `GROQ_API_KEY` | Groq key |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` |
-| `AI_WORKER_SECRET` | 32-byte hex |
-| `CRON_SECRET` | 32-byte hex |
-
-Do **not** add `DATABASE_URL_OWNER`.
-
-**Ordering matters.** `middleware.ts` reads `AUTH_JWT_SECRET`, and middleware
-environment variables are bound at build time on Vercel. If the variable is
-added after the build, the deployed middleware sees nothing, fails closed, and
-every protected route redirects to `/login`. Set the variables first, then
-deploy, or redeploy after adding them.
-
-4. Deploy.
-
-No `NEXT_PUBLIC_*` variable is required, and none should be added. There are
-zero `NEXT_PUBLIC` references in the application source; every secret is
-server-side by construction.
-
-No site-URL variable is needed either — nothing in the codebase hardcodes an
-origin.
-
----
-
-## 6. Cron and the AI worker
-
-`vercel.json` registers one job:
-
-```json
-{ "crons": [{ "path": "/api/worker/drain", "schedule": "0 3 * * *" }] }
+```powershell
+$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { $_.ToString('x2') })
 ```
 
-**Vercel Hobby limitation:** cron jobs run at most **once per day**, and the
-trigger time is approximate (within the hour). The schedule above is therefore
-a daily sweep, not a real queue drain.
+One each for `AUTH_JWT_SECRET` (signs session cookies) and `AI_WORKER_SECRET`
+(authenticates the scheduled and manual queue drain). Values shorter than 32
+characters, or still the `.dev.vars.example` placeholder, are refused: sign-in
+fails closed and the worker answers 401.
 
-This is a genuine constraint, not something the code papers over. The
-mitigation lives in `app/api/worker/drain/route.ts`: a signed-in user may also
-trigger a drain, which is what the UI does opportunistically after an action
-that enqueues work. Without it a candidate could apply and not see their
-assessment until the next day. It is safe to expose — draining processes system
-work and returns only a count, never a row.
+---
 
-Vercel automatically sends `Authorization: Bearer $CRON_SECRET` when
-`CRON_SECRET` is set, and the route compares it in constant time.
+## 6. Cloudflare Workers (Free plan)
 
-A genuinely frequent schedule requires a paid plan.
+```bash
+npx wrangler login        # opens a browser
+npx wrangler whoami       # confirm the intended account
+```
+
+`wrangler.jsonc` deploys a Worker named **`talentiq-demo`**. Deploying
+**replaces** any Worker of that name in the account; rename it first if the name
+is taken. Then:
+
+```bash
+npm run cf:deploy         # env-file check, OpenNext build, wrangler deploy
+npx wrangler secret put DATABASE_URL       # tip_app POOLED string (never the owner)
+npx wrangler secret put AUTH_JWT_SECRET
+npx wrangler secret put AI_WORKER_SECRET
+npx wrangler secret put GROQ_API_KEY       # optional
+```
+
+Never set `DATABASE_URL_OWNER` or `SEED_PASSWORD_*` as Worker secrets. The first
+deploy may ask you to choose a free `workers.dev` subdomain.
+
+(`vercel.json` is kept only for anyone deploying to Vercel instead; Cloudflare
+ignores it. On Vercel, `CRON_SECRET` authenticates its cron.)
+
+**Cron.** `wrangler.jsonc` registers one trigger (`0 3 * * *`, daily). The
+scheduled handler in `cloudflare/worker.ts` calls `/api/worker/drain` with
+`AI_WORKER_SECRET`. Workers Free allows 5 cron triggers per account; remove the
+`triggers` block if none are left. Signed-in users also drain one job at a time
+when they act, so the queue does not depend on the cron alone.
+
+**Free-plan fit.** The Worker bundle is about 1.7 MiB gzipped. Passwords are
+hashed and checked by PostgreSQL (pgcrypto bcrypt), so sign-in CPU stays in the
+database. Static assets are served free and unlimited; 100,000 Worker requests
+per day are included. **Not verified:** Workers Free allows 10 ms of CPU per
+request, and server-rendering a Next.js page can exceed that, which Cloudflare
+reports as error 1102. This could only be confirmed by a real deployment; if it
+happens, the remedy is a paid Workers plan, which this project deliberately
+does not assume.
 
 ---
 
 ## 7. Post-deploy verification
 
-On the live URL, in order:
-
-- [ ] Landing page renders, no console errors
-- [ ] `/jobs` loads while signed out and shows only active jobs
-- [ ] Register, sign in, sign out
-- [ ] **Security:** as a candidate, visit `/recruiter` and `/admin` — both must
-      redirect, not render
-- [ ] **Security:** as recruiter A, open an application belonging to recruiter
-      B by editing the URL — must 404/403, not render
-- [ ] Upload a resume; confirm the object is not publicly readable
-- [ ] Retrieve the resume as its owner; attempt retrieval as another user —
-      must be denied
-- [ ] Trigger an AI analysis and confirm it completes
-- [ ] Confirm the runtime is not the owner role:
+- [ ] `/`, `/jobs` and `/login` load; `/jobs` shows only active roles
+- [ ] Sign in as each seeded role; sign out
+- [ ] As a candidate, visit `/recruiter` and `/admin`: redirected, nothing rendered
+- [ ] As recruiter A, open recruiter B's job or application by URL: an error page
+      with none of B's data; the matching API calls answer 404
+- [ ] Six wrong passwords for one account from one browser: the sixth is `429`
+- [ ] `curl -X POST https://<worker>/api/worker/drain` without a token: `401`
+- [ ] The runtime is not the owner (Neon SQL editor, connected as `tip_app`):
 
 ```sql
-select current_user,
-       (select rolbypassrls from pg_roles where rolname = current_user);
+select current_user, (select rolbypassrls from pg_roles where rolname = current_user);
 ```
+
+Most of this is automated: `BASE_URL=https://<worker> bash scripts/test-http.sh`
+(43 anonymous checks; needs bash, e.g. Git Bash on Windows).
+
+---
+
+## 8. Local development and checks
+
+```bash
+npm ci
+cp .dev.vars.example .dev.vars     # PowerShell: Copy-Item .dev.vars.example .dev.vars
+npm run dev                        # next dev with .dev.vars, http://localhost:3000
+npm run cf:preview                 # the built Worker in workerd, http://localhost:8787
+npm test                           # static suites, no database needed
+npm run test:integration           # real PostgreSQL: the configured database
+```
+
+**Without Neon**: any local PostgreSQL 16+ works through the WebSocket proxy the
+driver needs. Run `npm run db:wsproxy` in its own terminal, set
+`NEON_LOCAL_WSPROXY=127.0.0.1:5488` and put the local server's owner string in
+`DATABASE_URL_UNPOOLED` in `.dev.vars`, then `db:migrate`, `db:setup-role`,
+`db:migrate`. CI does exactly this against a PostgreSQL 17 service.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `Refusing to build: these variables would be embedded in the deployed Worker` | Move them from `.env*` to `.dev.vars` (local) or Worker secrets (deployed). |
+| Every protected page redirects to `/login` | `AUTH_JWT_SECRET` missing, under 32 characters or a placeholder. |
+| `DATABASE_URL is not set` | The Worker secret is missing, or `.dev.vars` still holds the template string. |
+| A user sees other users' rows | The app is connected as the owner. Use the `tip_app` string (section 0). |
+| `REFUSING: the database has N table(s) but no migration ledger` | `DATABASE_URL_OWNER` points at a database not created for this app. |
+| `<file> was edited after it was applied` | Revert the edit and add a new numbered migration. |
+| `Refused: this database has N account(s) outside the @demo.internal demo domain` | Intended: seed a database created for the demo. |
+| `429 Too many failed sign-in attempts` | Wait 15 minutes; it applies to that email from your address. |
+| Upload or resume viewer: `503 Resume storage is not configured` | R2 is optional and not set up (section 4). |
+| AI jobs `failed: GROQ_API_KEY is not configured` | Set the key, then retry the jobs from Admin → AI. |
+| Error 1102 on a deployed page | Exceeded the Free plan's CPU limit (section 6). |
+| `WARN OpenNext is not fully compatible with Windows` | Builds work here, but WSL is recommended for production builds; CI builds on Linux. |
+| `git clone`: `Filename too long` (Windows) | Clone into a short path or `git config --global core.longpaths true`. |
 
 ---
 
 ## Cost guardrails
 
-| Service | Free tier | Watch for |
+| Service | Free allowance | Watch for |
 |---|---|---|
-| Neon | 0.5 GB storage, 100 CU-h/mo | Scales to zero after 5 min, first hit is slow |
-| Cloudflare R2 | 10 GB storage, no egress fees | Nothing at demo scale |
-| Vercel Hobby | 100 GB bandwidth, 300 s max duration, 4.5 MB request body | Cron once per day |
-| Groq | Rate-limited free usage | Queue absorbs 429s; avoid bulk screening right before a demo |
+| Neon | 0.5 GB storage, monthly compute hours | Scales to zero after 5 idle minutes |
+| Cloudflare Workers | 100,000 requests/day, 10 ms CPU/request, 5 crons/account | CPU limit on heavy pages (unverified) |
+| Cloudflare R2 (optional) | 10 GB storage | Account activation may need billing details; not verified here |
+| Groq (optional) | Rate-limited free usage | Queue absorbs 429s |

@@ -1,5 +1,5 @@
 import 'server-only';
-import { randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 
 const scrypt = promisify(scryptCb) as (
@@ -12,45 +12,42 @@ const scrypt = promisify(scryptCb) as (
 /**
  * Password hashing.
  *
- * MIGRATION NOTE: Supabase hashed passwords for us. scrypt from node:crypto
- * replaces that — memory-hard, in the standard library, and available on
- * Vercel's Node runtime, so no native module and no extra dependency.
+ * Passwords are hashed and checked by PostgreSQL itself, with pgcrypto's
+ * bcrypt:  crypt(password, gen_salt('bf', 10))  and
+ *          crypt(input, stored) = stored.
+ * The application never computes a hash. That keeps the CPU-heavy work off the
+ * Cloudflare Workers Free plan's 10 ms CPU budget: waiting for the database is
+ * I/O, not CPU. The SQL fragments below are used inside lib/auth/users.ts.
  *
- * The cost parameters are stored inside the encoded hash, so they can be
- * raised later without invalidating existing credentials.
+ * Earlier versions stored scrypt hashes computed in Node
+ * ("scrypt$N$r$p$salt$hash"). Those still verify (verifyLegacyPassword) and are
+ * replaced with bcrypt on the next successful sign-in.
  */
 
-const N = 16384; // CPU/memory cost
-const R = 8;
-const P = 1;
-const KEYLEN = 64;
-const SALT_BYTES = 16;
+export const BCRYPT_COST = 10;
+
+/** SQL expression hashing the text parameter `$n` with bcrypt. */
+export const hashSql = (param: string) => `crypt(${param}::text, gen_salt('bf', ${BCRYPT_COST}))`;
+
+/**
+ * A syntactically valid bcrypt hash that matches no password. Comparing against
+ * it when the email is unknown keeps the response time the same either way.
+ */
+export const DUMMY_HASH = '$2a$10$CwTycUXWue0Thq9StjUM0uJ8DPLKXt1FYlwYpQW2G3cAwjKoh2WZu';
+
+export function isLegacyHash(stored: string | null | undefined): boolean {
+  return typeof stored === 'string' && stored.startsWith('scrypt$');
+}
+
 // scrypt needs roughly 128 * N * r bytes; give it headroom over the default.
 const MAXMEM = 64 * 1024 * 1024;
 
-/** Encodes as  scrypt$N$r$p$<salt b64>$<hash b64>  */
-export async function hashPassword(password: string): Promise<string> {
-  if (typeof password !== 'string' || password.length === 0) {
-    throw new Error('Password must be a non-empty string.');
-  }
-  const salt = randomBytes(SALT_BYTES);
-  const derived = await scrypt(password, salt, KEYLEN, { N, r: R, p: P, maxmem: MAXMEM });
-  return [
-    'scrypt',
-    N,
-    R,
-    P,
-    salt.toString('base64'),
-    derived.toString('base64'),
-  ].join('$');
-}
-
 /**
- * Constant-time verification. Returns false for malformed stored values
- * rather than throwing, so a corrupt row cannot become an exception path that
- * behaves differently from a wrong password.
+ * Constant-time verification of a legacy scrypt hash. Returns false for
+ * malformed stored values rather than throwing, so a corrupt row cannot become
+ * an exception path that behaves differently from a wrong password.
  */
-export async function verifyPassword(
+export async function verifyLegacyPassword(
   password: string,
   stored: string,
 ): Promise<boolean> {

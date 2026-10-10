@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { drainQueue } from '@/lib/ai/service';
 import { getSessionUser } from '@/lib/auth/guards';
+import { usableSecret } from '@/lib/secrets';
 
 export const runtime = 'nodejs';
 export const maxDuration = 300;
@@ -26,8 +27,9 @@ function hasValidSecret(request: Request): boolean {
   const token = header.replace(/^Bearer\s+/i, '').trim();
   if (!token) return false;
 
-  const workerSecret = process.env.AI_WORKER_SECRET;
-  const cronSecret = process.env.CRON_SECRET;
+  // Placeholders and short values are ignored, so a copied .dev.vars.example never authenticates.
+  const workerSecret = usableSecret(process.env.AI_WORKER_SECRET);
+  const cronSecret = usableSecret(process.env.CRON_SECRET);
 
   if (workerSecret && timingSafeEqual(token, workerSecret)) return true;
   if (cronSecret && timingSafeEqual(token, cronSecret)) return true;
@@ -43,7 +45,8 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 
 async function handle(request: Request) {
-  if (!hasValidSecret(request)) {
+  const trusted = hasValidSecret(request);
+  if (!trusted) {
     const user = await getSessionUser();
     if (!user) {
       return NextResponse.json({ error: 'Unauthorized.' }, { status: 401 });
@@ -51,11 +54,13 @@ async function handle(request: Request) {
   }
 
   try {
-    // Defaults are sized for a free-tier token-per-minute ceiling. A caller
-    // on a paid plan can raise them: /api/worker/drain?limit=5&spacing=2000
+    // Defaults are sized for a free-tier token-per-minute ceiling. A secret
+    // holder can raise them: /api/worker/drain?limit=5&spacing=2000. A signed-in
+    // user (the UI nudge) always drains a single job, so a public demo visitor
+    // cannot spend the AI quota in bulk or hold a request open.
     const params = new URL(request.url).searchParams;
-    const limit = Math.min(10, Math.max(1, Number(params.get('limit')) || 1));
-    const spacing = Math.min(60_000, Math.max(0, Number(params.get('spacing')) || 0));
+    const limit = trusted ? Math.min(10, Math.max(1, Number(params.get('limit')) || 1)) : 1;
+    const spacing = trusted ? Math.min(60_000, Math.max(0, Number(params.get('spacing')) || 0)) : 0;
     const result = await drainQueue(limit, spacing);
     return NextResponse.json(result);
   } catch (err) {

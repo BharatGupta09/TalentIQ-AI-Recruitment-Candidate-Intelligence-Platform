@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import { jwtVerify } from 'jose';
+import { usableSecret } from '@/lib/secrets';
 
 /**
  * Coarse route gate.
@@ -24,8 +25,8 @@ async function hasValidSession(request: NextRequest): Promise<boolean> {
   const token = request.cookies.get(SESSION_COOKIE)?.value;
   if (!token) return false;
 
-  const raw = process.env.AUTH_JWT_SECRET;
-  if (!raw || raw.length < 32) {
+  const raw = usableSecret(process.env.AUTH_JWT_SECRET);
+  if (!raw) {
     // Misconfigured rather than unauthenticated. Fail closed for protected
     // routes; the guards will produce the real error.
     return false;

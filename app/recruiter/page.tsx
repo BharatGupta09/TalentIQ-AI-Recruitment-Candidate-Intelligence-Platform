@@ -18,9 +18,12 @@ export default async function RecruiterOverview() {
   const user = await requirePage('recruiter', 'admin');
   const db = await createClient();
 
-  // RLS scopes every one of these to jobs this recruiter owns.
-  const { data: jobs } = await db
-    .from('jobs').select('id, title, company, status').order('created_at', { ascending: false });
+  // RLS scopes applications to jobs this recruiter owns. Jobs need an explicit
+  // owner filter: every recruiter may also read all *active* jobs through the
+  // public job-board policy, and those must not appear as their own roles.
+  const jobsQuery = db.from('jobs').select('id, title, company, status');
+  if (user.role === 'recruiter') jobsQuery.eq('recruiter_id', user.id);
+  const { data: jobs } = await jobsQuery.order('created_at', { ascending: false });
 
   const { data: apps } = await db
     .from('applications')

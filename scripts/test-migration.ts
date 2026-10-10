@@ -12,7 +12,9 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { QueryBuilder } from '../lib/db/builder';
-import { hashPassword, verifyPassword } from '../lib/auth/password';
+import { DUMMY_HASH, hashSql, isLegacyHash, verifyLegacyPassword } from '../lib/auth/password';
+import { usableSecret } from '../lib/secrets';
+import { scrypt, randomBytes } from 'node:crypto';
 
 let pass = 0, fail = 0;
 function check(name: string, cond: boolean, extra = '') {
@@ -22,7 +24,7 @@ function check(name: string, cond: boolean, extra = '') {
 function section(title: string) { console.log(`\n[${title}]`); }
 
 const root = join(import.meta.dirname, '..');
-const read = (p: string) => readFileSync(join(root, p), 'utf8');
+const read = (p: string) => readFileSync(join(root, p), 'utf8').replace(/\r\n/g, '\n');
 
 /* ------------------------------------------------------------------ */
 /* A fake runner: captures SQL, returns canned rows.                    */
@@ -180,19 +182,24 @@ async function main() {
   section('password hashing');
 
   {
-    const hash = await hashPassword('correct horse battery staple');
-    check('hash is not the plaintext', !hash.includes('correct horse'));
-    check('hash records its algorithm and cost', hash.startsWith('scrypt$16384$8$1$'));
-    check('correct password verifies', await verifyPassword('correct horse battery staple', hash));
-    check('wrong password does not verify', !(await verifyPassword('wrong', hash)));
+    // New hashes are bcrypt, computed and compared by PostgreSQL (pgcrypto), so the
+    // Worker never spends CPU on hashing. Earlier scrypt hashes must still verify.
+    check('new hashes are bcrypt made by PostgreSQL',
+      hashSql('$2') === "crypt($2::text, gen_salt('bf', 10))");
+    check('the dummy hash is a well-formed bcrypt hash', /^\$2a\$10\$[./A-Za-z0-9]{53}$/.test(DUMMY_HASH));
 
-    const again = await hashPassword('correct horse battery staple');
-    check('same password hashes differently (salted)', hash !== again);
-    check('both salted hashes still verify', await verifyPassword('correct horse battery staple', again));
-
+    const salt = randomBytes(16);
+    const derived = await new Promise<Buffer>((resolve, reject) =>
+      scrypt('correct horse battery staple', salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 },
+        (err, key) => (err ? reject(err) : resolve(key))));
+    const legacy = ['scrypt', 16384, 8, 1, salt.toString('base64'), derived.toString('base64')].join('$');
+    check('a legacy scrypt hash is recognised', isLegacyHash(legacy) && !isLegacyHash(DUMMY_HASH));
+    check('correct password verifies against a legacy hash',
+      await verifyLegacyPassword('correct horse battery staple', legacy));
+    check('wrong password does not verify', !(await verifyLegacyPassword('wrong', legacy)));
     check('malformed stored hash returns false, does not throw',
-      !(await verifyPassword('x', 'not-a-hash')));
-    check('empty stored hash returns false', !(await verifyPassword('x', '')));
+      !(await verifyLegacyPassword('x', 'not-a-hash')));
+    check('empty stored hash returns false', !(await verifyLegacyPassword('x', '')));
   }
 
   section('session tokens');
@@ -205,7 +212,7 @@ async function main() {
     check('cookie is SameSite=Lax', /sameSite: 'lax'/.test(src));
     check('tokens are HS256', /alg: 'HS256'/.test(src));
     check('issuer is verified on the way in', /jwtVerify\([\s\S]{0,120}issuer: ISSUER/.test(src));
-    check('a short secret is refused', /raw\.length < 32/.test(src));
+    check('a short or placeholder secret is refused', /usableSecret\(process\.env\.AUTH_JWT_SECRET\)/.test(src));
     check('verification failure returns null rather than throwing',
       /catch \{[\s\S]{0,200}return null;/.test(src));
     check('the token carries no role claim (role is read live)',
@@ -221,22 +228,61 @@ async function main() {
     check('credential reads go through the auth escape only',
       /runAuthOp\(/.test(users) && !/serviceClient|dataClient/.test(users));
     check('deactivated accounts cannot authenticate',
-      /!row \|\| !ok \|\| !row\.is_active/.test(users));
+      /!row\.id \|\| !ok \|\| !row\.is_active/.test(users));
     check('an unknown email still costs a hash comparison (no timing oracle)',
-      /DUMMY_HASH/.test(users) && /row\?\.password_hash \?\? DUMMY_HASH/.test(users));
+      /DUMMY_HASH/.test(users) && /coalesce\(u\.password_hash, \$3::text\)/.test(users));
     // The hash is read internally; what matters is that it never leaves.
     const shape = users.slice(users.indexOf('export interface AuthenticatedUser'),
                               users.indexOf('}', users.indexOf('export interface AuthenticatedUser')));
     check('the returned user shape carries no credential field',
       !/password|hash/i.test(shape), shape);
     check('authenticate returns only the five public fields',
-      /return \{\s*id: row\.id,\s*email: row\.email,\s*role: row\.role,\s*fullName:[\s\S]{0,60}isActive: row\.is_active,\s*\};/.test(users));
+      /user: \{\s*id: row\.id,\s*email: row\.email,\s*role: row\.role,\s*fullName:[\s\S]{0,60}isActive: row\.is_active,\s*\}/.test(users));
     check('registration writes user, profile and candidate rows in one transaction',
       /runAuthOp\(async \(client\)[\s\S]{0,900}insert into profiles[\s\S]{0,400}candidate_profiles/.test(users));
     check('sign-in returns one message for every failure mode',
       (signin.match(/FAILED/g) ?? []).length >= 3 && /status: 401/.test(signin));
     check('sign-in does not echo the submitted password',
       !/console\.[a-z]+\([^)]*password/.test(signin));
+    check('repeated failures are throttled with 429',
+      /kind === 'throttled'/.test(signin) && /status: 429/.test(signin));
+    check('throttling is per email and client address, not per email alone',
+      /client_ip is not distinct from/.test(users) && /MAX_FAILURES_PER_EMAIL_IP = 5/.test(users));
+    check('legacy scrypt hashes are upgraded to bcrypt after a successful sign-in',
+      /verifyLegacyPassword\(password, row\.legacy_hash\)[\s\S]{0,200}update users set password_hash/.test(users));
+    const throttle = read('db/migrations/0003_login_throttle.sql');
+    check('login_failures has RLS forced and only the auth_op policy',
+      /force row level security/.test(throttle) && /app\.auth_op/.test(throttle)
+        && (throttle.match(/create policy/g) ?? []).length === 1);
+  }
+
+  section('secrets');
+
+  {
+    check('the .dev.vars.example placeholder is not a usable secret',
+      usableSecret('REPLACE_WITH_A_LONG_RANDOM_STRING') === null);
+    check('a "your_..._here" placeholder is not a usable secret',
+      usableSecret('your_auth_jwt_secret_goes_right_here') === null);
+    check('a secret shorter than 32 characters is refused', usableSecret('a'.repeat(31)) === null);
+    check('a random 48-character secret is accepted', usableSecret(randomBytes(36).toString('base64')) !== null);
+    const worker = read('app/api/worker/drain/route.ts');
+    check('worker secrets go through usableSecret',
+      /usableSecret\(process\.env\.AI_WORKER_SECRET\)/.test(worker)
+        && /usableSecret\(process\.env\.CRON_SECRET\)/.test(worker));
+    check('a signed-in user drains a single job only', /trusted \? Math\.min\(10[\s\S]{0,80}: 1;/.test(worker));
+    const mw = read('middleware.ts');
+    check('middleware refuses placeholder secrets too', /usableSecret\(process\.env\.AUTH_JWT_SECRET\)/.test(mw));
+  }
+
+  section('recruiter workspace scoping');
+
+  {
+    // jobs_public_read lets every recruiter read all ACTIVE jobs, so lists of
+    // "my roles" must filter by owner explicitly rather than rely on RLS.
+    for (const page of ['app/recruiter/page.tsx', 'app/recruiter/jobs/page.tsx']) {
+      check(`${page} lists only the recruiter's own jobs`,
+        /if \(user\.role === 'recruiter'\) jobsQuery\.eq\('recruiter_id', user\.id\)/.test(read(page)));
+    }
   }
 
   section('identity propagation');

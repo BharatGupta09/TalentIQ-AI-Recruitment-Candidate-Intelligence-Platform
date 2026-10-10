@@ -1,7 +1,7 @@
 /**
  * Rotates the demo account passwords and prints them once.
  *
- *   npx tsx --conditions=react-server --env-file=.env.local scripts/set-passwords.ts
+ *   npx tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/set-passwords.ts
  *
  * MIGRATION NOTE (Supabase -> Neon): this used the Supabase admin API to set
  * passwords. It now goes through lib/auth, which is the only code permitted to
@@ -14,7 +14,7 @@ import { setPassword } from '../lib/auth/users';
 
 if (!process.env.DATABASE_URL) {
   console.error('DATABASE_URL is not set.');
-  console.error('Run with:  npx tsx --conditions=react-server --env-file=.env.local scripts/set-passwords.ts');
+  console.error('Run with:  npx tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/set-passwords.ts');
   process.exit(1);
 }
 

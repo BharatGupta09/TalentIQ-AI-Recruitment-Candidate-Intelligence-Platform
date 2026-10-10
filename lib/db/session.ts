@@ -1,6 +1,6 @@
 import 'server-only';
 import type { PoolClient } from '@neondatabase/serverless';
-import { getPool } from './pool';
+import { connect } from './pool';
 
 /**
  * Transaction-scoped request identity.
@@ -35,13 +35,14 @@ export function assertUserId(id: string): string {
   return id;
 }
 
-export type Tx = PoolClient;
+/** What a transaction body may use: queries only, never pool or connection control. */
+export type Tx = Pick<PoolClient, 'query'>;
 
 async function withTransaction<T>(
-  setup: (client: PoolClient) => Promise<void>,
-  body: (client: PoolClient) => Promise<T>,
+  setup: (client: Tx) => Promise<void>,
+  body: (client: Tx) => Promise<T>,
 ): Promise<T> {
-  const client = await getPool().connect();
+  const client = await connect();
   try {
     await client.query('BEGIN');
     await setup(client);
@@ -56,7 +57,7 @@ async function withTransaction<T>(
     }
     throw err;
   } finally {
-    client.release();
+    await client.release();
   }
 }
 
@@ -66,7 +67,7 @@ async function withTransaction<T>(
  */
 export function runAsUser<T>(
   userId: string | null,
-  body: (client: PoolClient) => Promise<T>,
+  body: (client: Tx) => Promise<T>,
 ): Promise<T> {
   return withTransaction(async (client) => {
     if (userId !== null) {
@@ -90,7 +91,7 @@ export function runAsUser<T>(
  * Nothing outside lib/auth may call this.
  */
 export function runAuthOp<T>(
-  body: (client: PoolClient) => Promise<T>,
+  body: (client: Tx) => Promise<T>,
 ): Promise<T> {
   return withTransaction(async (client) => {
     await client.query('select set_config($1, $2, true)', ['app.auth_op', 'on']);
@@ -109,7 +110,7 @@ export function runAuthOp<T>(
  * request may call this.
  */
 export function runAsService<T>(
-  body: (client: PoolClient) => Promise<T>,
+  body: (client: Tx) => Promise<T>,
 ): Promise<T> {
   return withTransaction(async (client) => {
     await client.query('select set_config($1, $2, true)', ['app.service_op', 'on']);

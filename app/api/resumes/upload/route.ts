@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireCandidateId, errorResponse } from '@/lib/auth/guards';
 import { validateUpload, PdfError, PDF_ERROR_COPY } from '@/lib/resume/pdf';
-import { presignUpload, resumeKey, RESUME_CONTENT_TYPE } from '@/lib/storage/r2';
+import { isR2Configured, presignUpload, R2_NOT_CONFIGURED, resumeKey, RESUME_CONTENT_TYPE } from '@/lib/storage/r2';
 
 export const runtime = 'nodejs';
 
@@ -30,6 +30,7 @@ const Body = z.object({
 export async function POST(request: Request) {
   try {
     const { user } = await requireCandidateId();
+    if (!isR2Configured()) return NextResponse.json({ error: R2_NOT_CONFIGURED }, { status: 503 });
 
     const parsed = Body.safeParse(await request.json());
     if (!parsed.success) {

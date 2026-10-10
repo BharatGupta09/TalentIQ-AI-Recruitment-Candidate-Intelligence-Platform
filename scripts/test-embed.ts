@@ -224,8 +224,8 @@ async function main() {
   section('authorization is preserved');
 
   {
-    const embed = readFileSync(join(root, 'lib/db/embed.ts'), 'utf8');
-    const rels = readFileSync(join(root, 'lib/db/relationships.ts'), 'utf8');
+    const embed = readFileSync(join(root, 'lib/db/embed.ts'), 'utf8').replace(/\r\n/g, '\n');
+    const rels = readFileSync(join(root, 'lib/db/relationships.ts'), 'utf8').replace(/\r\n/g, '\n');
 
     check('embedding introduces no service-role escape',
       !/service_op|runAsService|serviceClient/.test(embed));
@@ -252,7 +252,7 @@ async function main() {
     // number (jsonb_build_object), while the same column selected directly
     // arrives as a string, because node-postgres decodes NUMERIC that way.
     // Callers are written against numbers, so the transport normalises it.
-    const pool = readFileSync(join(root, 'lib/db/pool.ts'), 'utf8');
+    const pool = readFileSync(join(root, 'lib/db/pool.ts'), 'utf8').replace(/\r\n/g, '\n');
     check('numeric is decoded as a number, matching the embedded path',
       /setTypeParser\(1700/.test(pool), 'no NUMERIC type parser registered');
     check('the reason is documented, not a bare magic number',

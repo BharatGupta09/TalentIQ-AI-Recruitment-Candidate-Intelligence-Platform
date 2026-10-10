@@ -14,12 +14,12 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const root = join(import.meta.dirname, '..');
-const rls = readFileSync(join(root, 'db/migrations/0002_rls.sql'), 'utf8');
-const schema = readFileSync(join(root, 'db/migrations/0001_schema.sql'), 'utf8');
-const guards = readFileSync(join(root, 'lib/auth/guards.ts'), 'utf8');
-const r2 = readFileSync(join(root, 'lib/storage/r2.ts'), 'utf8');
-const confirmRoute = readFileSync(join(root, 'app/api/resumes/confirm/route.ts'), 'utf8');
-const urlRoute = readFileSync(join(root, 'app/api/resumes/[id]/url/route.ts'), 'utf8');
+const rls = readFileSync(join(root, 'db/migrations/0002_rls.sql'), 'utf8').replace(/\r\n/g, '\n');
+const schema = readFileSync(join(root, 'db/migrations/0001_schema.sql'), 'utf8').replace(/\r\n/g, '\n');
+const guards = readFileSync(join(root, 'lib/auth/guards.ts'), 'utf8').replace(/\r\n/g, '\n');
+const r2 = readFileSync(join(root, 'lib/storage/r2.ts'), 'utf8').replace(/\r\n/g, '\n');
+const confirmRoute = readFileSync(join(root, 'app/api/resumes/confirm/route.ts'), 'utf8').replace(/\r\n/g, '\n');
+const urlRoute = readFileSync(join(root, 'app/api/resumes/[id]/url/route.ts'), 'utf8').replace(/\r\n/g, '\n');
 
 let pass = 0;
 let fail = 0;
@@ -238,7 +238,7 @@ check('confirm re-checks the stored object size server side',
   /objectSize\(key\)/.test(confirmRoute) && /MAX_RESUME_BYTES/.test(confirmRoute));
 
 check('signed read is gated by a database read first',
-  /from\('resumes'\)[\s\S]{0,200}maybeSingle\(\)[\s\S]{0,200}presignDownload/.test(urlRoute));
+  /from\('resumes'\)[\s\S]{0,200}maybeSingle\(\)[\s\S]{0,400}presignDownload/.test(urlRoute));
 
 check('an unreadable resume is a 404, indistinguishable from absent',
   /if \(!resume\) throw new AuthzError\(404/.test(urlRoute));

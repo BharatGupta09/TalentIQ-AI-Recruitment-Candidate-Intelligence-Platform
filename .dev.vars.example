@@ -1,0 +1,58 @@
+# Local configuration. Copy to .dev.vars and fill in your own values; .dev.vars is
+# git-ignored and is NEVER deployed. It is read by `npm run dev`, by
+# `npm run cf:preview` (wrangler), and by the database scripts.
+#
+# Do not put any of these in .env / .env.local / .env.production: the OpenNext
+# Cloudflare build copies those files into the deployed Worker (`npm run cf:build`
+# refuses to run if they contain anything but NEXT_PUBLIC_* or GROQ_MODEL).
+# Deployed values are Worker secrets: `npx wrangler secret put NAME`.
+# Placeholders below are rejected at runtime; they can never authenticate.
+
+# --- Neon PostgreSQL -------------------------------------------------
+# These two MUST be the least-privilege `tip_app` role, never neondb_owner.
+# Neon's owner role carries BYPASSRLS, which overrides row-level security
+# unconditionally — connecting as the owner switches off every policy in
+# db/migrations/0002_rls.sql silently. Run `npm run db:setup-role` and it
+# rewrites both of these for you. See DEPLOY.md section 0.
+#
+# Pooled connection string — used by the application at runtime.
+DATABASE_URL=postgresql://tip_app:PASSWORD@HOST-pooler.REGION.aws.neon.tech/DB?sslmode=require
+# Direct (unpooled) connection.
+DATABASE_URL_UNPOOLED=postgresql://tip_app:PASSWORD@HOST.REGION.aws.neon.tech/DB?sslmode=require
+
+# Owner connection. LOCAL ONLY — never a Worker secret. Used exclusively by
+# `npm run db:migrate` and `npm run db:setup-role` for DDL. Before the first
+# `db:setup-role`, put the owner (direct) string in DATABASE_URL_UNPOOLED instead.
+DATABASE_URL_OWNER=postgresql://OWNER:PASSWORD@HOST.REGION.aws.neon.tech/DB?sslmode=require
+
+# Local PostgreSQL instead of Neon (development/CI only): run `npm run db:wsproxy`
+# and set this. Never set it in a deployment.
+# NEON_LOCAL_WSPROXY=127.0.0.1:5488
+
+# --- Authentication --------------------------------------------------
+# At least 32 random characters. Generate with:  openssl rand -base64 48
+AUTH_JWT_SECRET=REPLACE_WITH_A_LONG_RANDOM_STRING
+
+# --- Cloudflare R2 (S3-compatible API) — OPTIONAL ---------------------
+# Only resume PDF upload and viewing use R2. Leave these as they are and those
+# two features answer "storage not configured"; everything else works.
+R2_ACCOUNT_ID=REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID
+R2_BUCKET=REPLACE_WITH_BUCKET_NAME
+R2_ACCESS_KEY_ID=REPLACE_WITH_R2_ACCESS_KEY_ID
+R2_SECRET_ACCESS_KEY=REPLACE_WITH_R2_SECRET_ACCESS_KEY
+
+# --- AI (Groq) -------------------------------------------------------
+# Without a key, AI analyses stay queued or fail with "not configured".
+GROQ_API_KEY=REPLACE_WITH_GROQ_KEY
+GROQ_MODEL=llama-3.3-70b-versatile
+
+# --- Background worker -----------------------------------------------
+# At least 32 random characters (openssl rand -hex 32). The Worker's daily
+# cron trigger and manual `curl` drains present it as a bearer token.
+AI_WORKER_SECRET=REPLACE_WITH_RANDOM_32_BYTE_HEX
+
+# --- Seeding (scripts only, never needed at runtime) ------------------
+# Your own passwords, at least 12 characters each; the placeholders are refused.
+SEED_PASSWORD_CANDIDATE=REPLACE_FOR_LOCAL_SEEDING
+SEED_PASSWORD_RECRUITER=REPLACE_FOR_LOCAL_SEEDING
+SEED_PASSWORD_ADMIN=REPLACE_FOR_LOCAL_SEEDING

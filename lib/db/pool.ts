@@ -1,25 +1,23 @@
 import 'server-only';
-import { Pool, neonConfig, types } from '@neondatabase/serverless';
+import { Client, Pool, types } from '@neondatabase/serverless';
+import './neon-config';
 
 /**
- * Neon connection pool.
+ * Neon connections.
  *
  * MIGRATION NOTE (Supabase -> Neon):
  * This replaces the PostgREST transport that @supabase/ssr used. Queries now
- * go straight to Postgres over a pooled connection, which is what makes
- * transaction-scoped identity (`SET LOCAL app.user_id`) possible — and that,
- * in turn, is what lets the RLS policies survive the migration unchanged.
+ * go straight to Postgres, which is what makes transaction-scoped identity
+ * (`SET LOCAL app.user_id`) possible — and that, in turn, is what lets the RLS
+ * policies survive the migration unchanged.
  *
- * The pool is module-scoped so a warm serverless instance reuses connections
- * rather than opening one per request.
+ * Two runtimes, two shapes:
+ *   - Node (next dev, scripts): one module-scoped pool, so a warm process
+ *     reuses connections.
+ *   - Cloudflare Workers: a WebSocket opened while handling one request cannot
+ *     be used by another, so a pool shared between requests fails there. Each
+ *     transaction opens its own connection and closes it afterwards.
  */
-
-// Neon's Pool speaks WebSocket. Node 22+ (Vercel's runtime) exposes a global
-// constructor, so no `ws` dependency is needed. Assigning it explicitly keeps
-// the failure mode obvious if that ever stops being true.
-if (typeof globalThis.WebSocket !== 'undefined') {
-  neonConfig.webSocketConstructor = globalThis.WebSocket;
-}
 
 /**
  * NUMERIC arrives as a JavaScript number, not a string.
@@ -48,28 +46,43 @@ declare global {
   var __tipPool: Pool | undefined;
 }
 
+/** Template placeholders (.dev.vars.example's ":PASSWORD@HOST") count as not configured. */
+const PLACEHOLDER = /^(|your[_-].*|.*[_-]here|replace[_-].*|changeme|placeholder)$/i;
+
+export function isDatabaseConfigured(): boolean {
+  const url = process.env.DATABASE_URL?.trim() ?? '';
+  return !PLACEHOLDER.test(url) && !url.includes(':PASSWORD@HOST');
+}
+
 function connectionString(): string {
-  const url = process.env.DATABASE_URL;
-  if (!url) {
+  if (!isDatabaseConfigured()) {
     throw new Error(
       'DATABASE_URL is not set. Point it at the Neon *pooled* connection string.',
     );
   }
-  return url;
+  return process.env.DATABASE_URL!.trim();
+}
+
+export function isWorkersRuntime(): boolean {
+  return typeof navigator !== 'undefined' && navigator.userAgent === 'Cloudflare-Workers';
+}
+
+function assertWebSocket(): void {
+  if (typeof globalThis.WebSocket === 'undefined') {
+    throw new Error(
+      'No global WebSocket. @neondatabase/serverless needs one; run on Node 22+ ' +
+      'or set neonConfig.webSocketConstructor explicitly.',
+    );
+  }
 }
 
 /**
- * Single shared pool, cached on globalThis so Next.js dev's module reloading
- * does not leak a new pool on every edit.
+ * Single shared pool for Node, cached on globalThis so Next.js dev's module
+ * reloading does not leak a new pool on every edit. Not for Workers.
  */
 export function getPool(): Pool {
   if (!globalThis.__tipPool) {
-    if (typeof globalThis.WebSocket === 'undefined') {
-      throw new Error(
-        'No global WebSocket. @neondatabase/serverless needs one; run on Node 22+ ' +
-        'or set neonConfig.webSocketConstructor explicitly.',
-      );
-    }
+    assertWebSocket();
     globalThis.__tipPool = new Pool({
       connectionString: connectionString(),
       // Neon's free tier scales to zero after five minutes of inactivity.
@@ -81,4 +94,27 @@ export function getPool(): Pool {
     });
   }
   return globalThis.__tipPool;
+}
+
+export interface Connection {
+  query: Client['query'];
+  release(): Promise<void>;
+}
+
+/** A connection for one transaction: pooled on Node, private on Workers. */
+export async function connect(): Promise<Connection> {
+  if (!isWorkersRuntime()) {
+    const client = await getPool().connect();
+    return {
+      query: client.query.bind(client) as Client['query'],
+      release: async () => { client.release(); },
+    };
+  }
+  assertWebSocket();
+  const client = new Client({ connectionString: connectionString() });
+  await client.connect();
+  return {
+    query: client.query.bind(client) as Client['query'],
+    release: () => client.end().catch(() => undefined),
+  };
 }

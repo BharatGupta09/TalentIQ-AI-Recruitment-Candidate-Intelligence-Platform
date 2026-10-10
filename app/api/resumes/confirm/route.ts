@@ -6,7 +6,7 @@ import { enqueue } from '@/lib/ai/service';
 import {
   extractPdfText, checksum, PdfError, PDF_ERROR_COPY, MAX_RESUME_BYTES,
 } from '@/lib/resume/pdf';
-import { objectSize, getObjectBytes, deleteObject, resumeKey } from '@/lib/storage/r2';
+import { objectSize, getObjectBytes, deleteObject, resumeKey, isR2Configured, R2_NOT_CONFIGURED } from '@/lib/storage/r2';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -32,6 +32,7 @@ const Body = z.object({
 export async function POST(request: Request) {
   try {
     const { user, candidateId } = await requireCandidateId();
+    if (!isR2Configured()) return NextResponse.json({ error: R2_NOT_CONFIGURED }, { status: 503 });
 
     const parsed = Body.safeParse(await request.json());
     if (!parsed.success) {

@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // TalentIQ on Cloudflare Workers (Free plan), built with the OpenNext adapter:
+  //   npm run cf:build     -> .open-next/ (worker + static assets)
+  //   npm run cf:preview   -> the built Worker locally in workerd
+  //   npm run cf:deploy    -> build + wrangler deploy
+  //
+  // The Worker name is demo-specific so a deployment cannot replace another
+  // Worker in the same account. No account id, routes or custom domains are set.
+  //
+  // Secrets (never in this file; `npx wrangler secret put NAME`):
+  //   DATABASE_URL       Neon pooled string for the tip_app role (not the owner)
+  //   AUTH_JWT_SECRET    32+ random characters
+  //   AI_WORKER_SECRET   32+ random characters (scheduled drain and manual calls)
+  //   GROQ_API_KEY       optional; AI analysis stays queued without it
+  //   R2_*               optional; resume upload/viewing only (see README)
+  "name": "talentiq-demo",
+  "main": "cloudflare/worker.ts",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+
+  // OpenNext calls back into the same Worker for some internal requests.
+  "services": [
+    { "binding": "WORKER_SELF_REFERENCE", "service": "talentiq-demo" }
+  ],
+
+  // Replaces vercel.json's cron: drain the AI queue once a day (03:00 UTC).
+  // Workers Free allows 5 cron triggers per account; remove this if the account
+  // has none left. Users' own actions also drain the queue.
+  "triggers": { "crons": ["0 3 * * *"] },
+
+  "vars": {
+    "GROQ_MODEL": "llama-3.3-70b-versatile"
+  },
+
+  "observability": { "enabled": true }
+}

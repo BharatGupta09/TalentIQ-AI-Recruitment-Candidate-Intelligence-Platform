@@ -11,9 +11,11 @@ export default async function RecruiterJobs() {
   const user = await requirePage('recruiter', 'admin');
   const db = await createClient();
 
-  const { data: jobs } = await db
-    .from('jobs').select('id, title, company, location, status, created_at, spec_version')
-    .order('created_at', { ascending: false });
+  // Owner filter for recruiters: the public job-board policy also lets them read
+  // every *active* job, which must not be listed as their own roles.
+  const jobsQuery = db.from('jobs').select('id, title, company, location, status, created_at, spec_version');
+  if (user.role === 'recruiter') jobsQuery.eq('recruiter_id', user.id);
+  const { data: jobs } = await jobsQuery.order('created_at', { ascending: false });
 
   const { data: apps } = await db.from('applications').select('job_id');
   const counts = new Map<string, number>();

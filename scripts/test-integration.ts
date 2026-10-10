@@ -1,7 +1,7 @@
 /**
  * Integration suite — runs against a REAL PostgreSQL database.
  *
- *   npx tsx --conditions=react-server --env-file=.env.local scripts/test-integration.ts
+ *   npx tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/test-integration.ts
  *
  * Everything else in this repository's test suite is static or fake-runner
  * driven. This is the one that actually executes: it validates the migrated
@@ -17,7 +17,8 @@
  */
 import { Client, neonConfig } from '@neondatabase/serverless';
 import { dataClient, serviceClient, runAsUser } from '../lib/db';
-import { registerUser, authenticate } from '../lib/auth/users';
+import { registerUser, authenticate, signIn } from '../lib/auth/users';
+import { randomBytes, scrypt } from 'node:crypto';
 import { createSessionToken, verifySessionToken } from '../lib/auth/session';
 import { RELATIONSHIPS } from '../lib/db/relationships';
 
@@ -57,7 +58,7 @@ async function main() {
   const tables = (await sql.query(
     `select table_name from information_schema.tables
       where table_schema='public' and table_type='BASE TABLE' order by 1`)).rows.map(r => r.table_name);
-  check('28 tables exist (27 original + users)', tables.length === 28, `${tables.length}`);
+  check('29 tables exist (27 original + users + login_failures)', tables.length === 29, `${tables.length}`);
   for (const t of ['users','profiles','candidate_profiles','jobs','applications',
                    'application_scores','application_analyses','resumes','ai_jobs']) {
     check(`table ${t}`, tables.includes(t));
@@ -150,13 +151,37 @@ async function main() {
 
   const hashRow = await sql.query('select password_hash from users where id=$1', [A]);
   const stored = hashRow.rows[0].password_hash as string;
-  check('password is stored as a scrypt hash, never plaintext',
-    stored.startsWith('scrypt$') && !stored.includes(PW));
+  check('password is stored as a bcrypt hash made by PostgreSQL, never plaintext',
+    /^\$2a\$10\$/.test(stored) && !stored.includes(PW));
 
   await sql.query('update profiles set is_active=false where id=$1', [B]);
   check('deactivated account cannot authenticate', (await authenticate(email('recb'), PW)) === null);
   await sql.query('update profiles set is_active=true where id=$1', [B]);
   check('reactivated account can authenticate again', (await authenticate(email('recb'), PW))?.id === B);
+
+  // A scrypt hash written by an earlier version still signs in, and is replaced with bcrypt.
+  const salt = randomBytes(16);
+  const derived = await new Promise<Buffer>((resolve, reject) =>
+    scrypt(PW, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 },
+      (err, key) => (err ? reject(err) : resolve(key))));
+  const legacy = ['scrypt', 16384, 8, 1, salt.toString('base64'), derived.toString('base64')].join('$');
+  await sql.query('update users set password_hash=$2 where id=$1', [B, legacy]);
+  check('a legacy scrypt hash still authenticates', (await authenticate(email('recb'), PW))?.id === B);
+  const upgraded = (await sql.query('select password_hash from users where id=$1', [B])).rows[0].password_hash as string;
+  check('the legacy hash is replaced with bcrypt after sign-in', /^\$2a\$10\$/.test(upgraded));
+  check('the upgraded hash still authenticates', (await authenticate(email('recb'), PW))?.id === B);
+
+  section('sign-in throttling (per email and client address)');
+
+  for (let i = 0; i < 5; i++) await signIn(email('reca'), `wrong-${i}`, '203.0.113.9');
+  check('after 5 failures the same address is paused, even with the right password',
+    (await signIn(email('reca'), PW, '203.0.113.9')).kind === 'throttled');
+  check('the same account still signs in from another address',
+    (await signIn(email('reca'), PW, '198.51.100.7')).kind === 'ok');
+  const recorded = await sql.query('select count(*)::int n from login_failures where email=$1', [email('reca')]);
+  check('failures are recorded for the throttle window', recorded.rows[0].n === 5, `${recorded.rows[0].n}`);
+  check('the application role cannot read login_failures outside the auth path',
+    (await runAsUser(A, async (c) => (await c.query('select count(*)::int n from login_failures')).rows[0].n)) === 0);
 
   const token = await createSessionToken(A);
   check('session token verifies and carries the subject', (await verifySessionToken(token))?.sub === A);
@@ -491,6 +516,7 @@ async function main() {
   await sql.query(
     `delete from jobs where recruiter_id in (select id from profiles where email like $1)`,
     [`%${MARK}@phase3.test`]);
+  await sql.query(`delete from login_failures where email like $1`, [`%${MARK}@phase3.test`]);
   const cleanup = await sql.query(
     `delete from users where email like $1 returning id`, [`%${MARK}@phase3.test`]);
   check('test users removed (cascades to profiles, candidates, resumes)',
@@ -503,7 +529,7 @@ async function main() {
   const schemaIntact = await sql.query(
     `select count(*)::int n from information_schema.tables
       where table_schema='public' and table_type='BASE TABLE'`);
-  check('schema is left intact after cleanup', schemaIntact.rows[0].n === 28, `${schemaIntact.rows[0].n}`);
+  check('schema is left intact after cleanup', schemaIntact.rows[0].n === 29, `${schemaIntact.rows[0].n}`);
 
   await sql.end();
 

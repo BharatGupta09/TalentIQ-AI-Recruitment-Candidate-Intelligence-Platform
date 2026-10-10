@@ -10,20 +10,40 @@
  * same prompts a live application uses — so seeded scores are genuine
  * outputs, not hand-written numbers.
  *
- * Usage:  npx tsx --conditions=react-server --env-file=.env.local scripts/seed.ts
+ * Usage:  npx tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/seed.ts
  * Requires DATABASE_URL, AUTH_JWT_SECRET and GROQ_API_KEY.
  */
 
-import { serviceClient } from '../lib/db';
+import { serviceClient, runAuthOp, isDatabaseConfigured } from '../lib/db';
 import { registerUser, setPassword } from '../lib/auth/users';
 import { randomUUID } from 'node:crypto';
 
-if (!process.env.DATABASE_URL || !process.env.AUTH_JWT_SECRET) {
-  console.error('Set DATABASE_URL and AUTH_JWT_SECRET before seeding.');
+if (!isDatabaseConfigured()) {
+  console.error('Set DATABASE_URL before seeding (npm run db:migrate and db:setup-role first).');
   process.exit(1);
 }
 
 const db = serviceClient();
+
+/**
+ * Safeguard: the demo accounts get passwords that are shared for the demo, so
+ * seeding is refused for any database that holds an account outside the demo
+ * domain (a sign that it holds real users). There is no override.
+ */
+async function assertDemoDatabase(): Promise<void> {
+  const foreign = await runAuthOp(async (client) => {
+    const res = await client.query(
+      `select count(*)::int as n from users
+        where email not like '%@demo.internal' and email not like '%.test'`);
+    return res.rows[0].n as number;
+  });
+  if (foreign > 0) {
+    console.error(
+      `Refused: this database has ${foreign} account(s) outside the @demo.internal demo domain, ` +
+      'so it may hold real data. Seed a database created for the demo.');
+    process.exit(1);
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* Accounts                                                            */
@@ -37,8 +57,9 @@ const db = serviceClient();
 function passwordFor(role: string): string {
   const key = `SEED_PASSWORD_${role.toUpperCase()}`;
   const value = process.env[key];
-  if (!value || value.length < 12) {
-    console.error(`Set ${key} to a password of at least 12 characters before seeding.`);
+  // The template value is public, so it must never become a demo password.
+  if (!value || value.length < 12 || /^REPLACE_/i.test(value)) {
+    console.error(`Set ${key} to your own password of at least 12 characters before seeding.`);
     process.exit(1);
   }
   return value;
@@ -371,6 +392,7 @@ const APPLICATIONS: Array<{ candidate: string; job: string; stage: string }> = [
 
 async function main() {
   console.log('Seeding demo environment\n');
+  await assertDemoDatabase();
 
   // --- Accounts -----------------------------------------------------
   const userIds = new Map<string, string>();
@@ -458,10 +480,20 @@ async function main() {
   // --- Resumes ------------------------------------------------------
   // Text is inserted directly; there is no PDF to store for seeded data, so
   // the storage path is marked as seeded and the viewer degrades gracefully.
+  // Re-running reuses the seeded resume instead of adding another one.
   const resumeIds = new Map<string, string>();
+  const newResumeIds: string[] = [];
   for (const [email, resume] of Object.entries(RESUMES)) {
     const candidateId = candidateIds.get(email);
     if (!candidateId) continue;
+
+    const { data: active } = await db.from('resumes').select('id, storage_path')
+      .eq('candidate_id', candidateId).eq('file_name', resume.fileName).eq('is_active', true);
+    const existing = (active ?? []).find((r) => String(r.storage_path).startsWith('seed/'));
+    if (existing) {
+      resumeIds.set(email, existing.id as string);
+      continue;
+    }
 
     await db.from('resumes').update({ is_active: false }).eq('candidate_id', candidateId);
 
@@ -479,17 +511,26 @@ async function main() {
     });
     if (error) throw error;
     resumeIds.set(email, id);
+    newResumeIds.push(id);
   }
-  console.log(`  ${resumeIds.size} resumes`);
+  console.log(`  ${resumeIds.size} resumes (${newResumeIds.length} new)`);
 
   // --- Jobs ---------------------------------------------------------
   const jobIds = new Map<string, string>();
   const recruiterA = userIds.get('recruiter@demo.internal')!;
   const recruiterB = userIds.get('recruiter2@demo.internal')!;
 
+  const newJobIds: string[] = [];
   for (const job of JOBS) {
     const owner = job.key === 'frontend' ? recruiterB : recruiterA;
     const status = job.status;
+    const { data: existing } = await db.from('jobs').select('id')
+      .eq('recruiter_id', owner).eq('title', job.title).maybeSingle();
+    if (existing) {
+      jobIds.set(job.key, existing.id as string);
+      console.log(`  role     ${job.title} (exists)`);
+      continue;
+    }
     const { data, error } = await db.from('jobs').insert({
       recruiter_id: owner,
       title: job.title, company: job.company, location: job.location,
@@ -504,16 +545,18 @@ async function main() {
     }).select('id').single();
     if (error) throw error;
     jobIds.set(job.key, data.id);
+    newJobIds.push(data.id);
     console.log(`  role     ${job.title}`);
   }
 
   // --- Queue the real AI pipeline -----------------------------------
   // Specifications are derived first: screening depends on job_requirements
-  // existing, so ordering matters here.
+  // existing, so ordering matters here. Only newly created records are queued,
+  // so re-running the seed does not spend the AI quota again.
   let queued = 0;
   for (const [kind, ids] of [
-    ['job_analysis', Array.from(jobIds.values())],
-    ['resume_analysis', Array.from(resumeIds.values())],
+    ['job_analysis', newJobIds],
+    ['resume_analysis', newResumeIds],
   ] as const) {
     for (const id of ids) {
       const { error } = await db.from('ai_jobs').insert({ kind, ref_id: id });
@@ -575,7 +618,10 @@ async function main() {
   // --- Recruiter annotations ----------------------------------------
   const { data: shortlisted } = await db
     .from('applications').select('id').eq('stage', 'shortlisted').limit(1);
-  if (shortlisted?.[0]) {
+  const { data: existingNotes } = shortlisted?.[0]
+    ? await db.from('recruiter_notes').select('id').eq('application_id', shortlisted[0].id).limit(1)
+    : { data: [] };
+  if (shortlisted?.[0] && !existingNotes?.length) {
     await db.from('recruiter_notes').insert({
       application_id: shortlisted[0].id, recruiter_id: recruiterA,
       body: 'Strong streaming background and the cost reduction is quantified, which is rare. Want to probe the data contracts work — that is the closest thing to what we need next quarter.',

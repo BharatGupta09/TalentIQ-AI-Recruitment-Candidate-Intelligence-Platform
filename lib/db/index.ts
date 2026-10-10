@@ -4,7 +4,7 @@ import { runAsUser, runAsService } from './session';
 
 export type { Result, PgError } from './builder';
 export { runAsUser, runAsService, runAuthOp, assertUserId } from './session';
-export { getPool } from './pool';
+export { getPool, isDatabaseConfigured } from './pool';
 
 /**
  * The data client.

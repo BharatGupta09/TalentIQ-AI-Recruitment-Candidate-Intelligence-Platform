@@ -1,6 +1,7 @@
 import 'server-only';
 import { SignJWT, jwtVerify } from 'jose';
 import { cookies } from 'next/headers';
+import { usableSecret } from '@/lib/secrets';
 
 /**
  * Session tokens.
@@ -17,10 +18,11 @@ const ISSUER = 'talent-intelligence-platform';
 const MAX_AGE_SECONDS = 60 * 60 * 8; // one working day
 
 function secret(): Uint8Array {
-  const raw = process.env.AUTH_JWT_SECRET;
-  if (!raw || raw.length < 32) {
+  // Missing, shorter than 32 characters, or the .dev.vars.example placeholder: refused.
+  const raw = usableSecret(process.env.AUTH_JWT_SECRET);
+  if (!raw) {
     throw new Error(
-      'AUTH_JWT_SECRET is missing or too short (needs at least 32 characters).',
+      'AUTH_JWT_SECRET is missing, too short (needs at least 32 characters) or a placeholder.',
     );
   }
   return new TextEncoder().encode(raw);

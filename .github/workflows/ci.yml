@@ -1,0 +1,79 @@
+name: CI
+
+# Checks only: nothing is deployed and no repository secrets are used.
+# A throwaway PostgreSQL 17 service stands in for Neon. The application reaches
+# it through Neon's own driver and a local WebSocket proxy (scripts/dev/wsproxy.mjs),
+# connected as the least-privilege tip_app role, so row-level security is
+# genuinely enforced. R2 and Groq are not configured here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-only-throwaway   # throwaway database inside the runner
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm }
+      - run: npm ci
+      - name: Type check
+        run: npm run typecheck
+      - name: Static suites (scoring, authorization, PDF, AI, migration, embedded selects)
+        run: npm test
+      - name: Local configuration for the throwaway database
+        run: |
+          U=postgresql://postgres:ci-only-throwaway@127.0.0.1:5432/postgres
+          {
+            echo "DATABASE_URL=$U"
+            echo "DATABASE_URL_UNPOOLED=$U"
+            echo "AUTH_JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')"
+            echo "AI_WORKER_SECRET=$(openssl rand -hex 32)"
+            echo "NEON_LOCAL_WSPROXY=127.0.0.1:5488"
+            echo "SEED_PASSWORD_CANDIDATE=$(openssl rand -hex 12)"
+            echo "SEED_PASSWORD_RECRUITER=$(openssl rand -hex 12)"
+            echo "SEED_PASSWORD_ADMIN=$(openssl rand -hex 12)"
+          } > .dev.vars
+      - name: Migrations, least-privilege role, demo seed (each twice)
+        run: |
+          node scripts/dev/wsproxy.mjs > wsproxy.log 2>&1 &
+          for i in $(seq 1 20); do (exec 3<>/dev/tcp/127.0.0.1/5488) 2>/dev/null && break; sleep 1; done
+          npm run --silent db:migrate && npm run --silent db:setup-role && npm run --silent db:migrate
+          npm run --silent seed && npm run --silent seed
+      - name: Integration suite (real PostgreSQL, RLS enforced)
+        run: npm run --silent test:integration
+      - name: Cloudflare build (OpenNext) and wrangler dry run
+        run: |
+          npm run cf:build
+          npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/cf"
+      - name: HTTP checks against the Worker (workerd, wrangler dev)
+        run: |
+          npx wrangler dev --port 8787 --ip 127.0.0.1 > wrangler.log 2>&1 &
+          for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8787/ && break; sleep 2; done
+          BASE_URL=http://127.0.0.1:8787 bash scripts/test-http.sh
+      - name: Logs
+        if: failure()
+        run: cat wrangler.log wsproxy.log 2>/dev/null || true

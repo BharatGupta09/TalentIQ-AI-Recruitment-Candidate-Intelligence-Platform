@@ -3,12 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "node --env-file-if-exists=.dev.vars ./node_modules/next/dist/bin/next dev",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "seed": "tsx --conditions=react-server --env-file=.env.local scripts/seed.ts",
+    "seed": "tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/seed.ts",
     "test:scoring": "tsx scripts/test-scoring.ts",
     "test:authz": "tsx scripts/test-authz.ts",
     "test:pdf": "tsx --conditions=react-server scripts/test-pdf.ts",
@@ -17,9 +17,15 @@
     "test:http": "bash scripts/test-http.sh",
     "test:migration": "tsx --conditions=react-server scripts/test-migration.ts",
     "test:embed": "tsx --conditions=react-server scripts/test-embed.ts",
-    "db:migrate": "tsx --conditions=react-server --env-file=.env.local scripts/db-migrate.ts",
-    "test:integration": "tsx --conditions=react-server --env-file=.env.local scripts/test-integration.ts",
-    "db:setup-role": "tsx --conditions=react-server --env-file=.env.local scripts/db-setup-role.ts"
+    "db:migrate": "tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/db-migrate.ts",
+    "test:integration": "tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/test-integration.ts",
+    "db:setup-role": "tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/db-setup-role.ts",
+    "cf:build": "node scripts/check-env-files.mjs && opennextjs-cloudflare build",
+    "cf:preview": "npm run cf:build && opennextjs-cloudflare preview",
+    "cf:deploy": "npm run cf:build && opennextjs-cloudflare deploy",
+    "db:wsproxy": "node scripts/dev/wsproxy.mjs",
+    "check:env": "node scripts/check-env-files.mjs",
+    "db:set-passwords": "tsx --conditions=react-server --env-file-if-exists=.dev.vars scripts/set-passwords.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1132.0",
@@ -27,7 +33,7 @@
     "@neondatabase/serverless": "^1.1.0",
     "groq-sdk": "1.5.0",
     "jose": "^6.2.12",
-    "next": "15.5.23",
+    "next": "15.5.27",
     "pdf-parse": "2.4.5",
     "react": "19.2.8",
     "react-dom": "19.2.8",
@@ -36,6 +42,7 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@opennextjs/cloudflare": "1.20.6",
     "@types/node": "26.2.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",
@@ -45,6 +52,11 @@
     "postcss": "8.5.26",
     "tailwindcss": "3.4.19",
     "tsx": "4.23.11",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "wrangler": "4.149.0",
+    "ws": "8.22.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

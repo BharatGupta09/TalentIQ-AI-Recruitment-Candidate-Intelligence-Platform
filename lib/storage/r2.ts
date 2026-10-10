@@ -38,6 +38,23 @@ function required(name: string): string {
   return value;
 }
 
+const R2_SETTINGS = ['R2_ACCOUNT_ID', 'R2_BUCKET', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY'] as const;
+
+/**
+ * Whether R2 credentials are present (not whether they work). R2 is an optional
+ * integration: without it, resume upload and viewing answer 503 and the rest of
+ * the application is unaffected.
+ */
+export function isR2Configured(): boolean {
+  return R2_SETTINGS.every((name) => {
+    const value = process.env[name]?.trim();
+    return !!value && !/^REPLACE_/i.test(value);
+  });
+}
+
+export const R2_NOT_CONFIGURED =
+  'Resume storage is not configured on this deployment, so PDF upload and viewing are unavailable.';
+
 export function bucket(): string {
   return required('R2_BUCKET');
 }

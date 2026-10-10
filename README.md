@@ -1,10 +1,12 @@
 # AI Resume Screening & Talent Intelligence Platform
 
-> **No live deployment.** An earlier demo ran against a Supabase backend that no
-> longer exists. The platform has since been migrated to Neon PostgreSQL and
-> Cloudflare R2 and is verified locally and against a real Neon database, but it
-> has not been redeployed. See [`STATUS.md`](./STATUS.md) for exactly what is and
-> is not proven.
+> **Public showcase repository with fictional demo data. No live deployment.**
+> An earlier demo ran on Supabase and Vercel. The platform now runs on Neon
+> PostgreSQL and Cloudflare Workers (Free plans), and is verified locally: the
+> Worker runs in Cloudflare's runtime (`workerd`) against a real PostgreSQL in
+> CI. It has not been deployed to Cloudflare, and the optional R2 (resume PDF)
+> and Groq (AI) integrations have not been exercised against the real services.
+> See [`STATUS.md`](./STATUS.md) for exactly what is and is not proven.
 
 An evidence-first recruitment platform. Every claim it makes about a candidate
 is traceable to the line of the resume it came from.
@@ -84,15 +86,16 @@ uploaded file — the record degrades to a recoverable state instead.
 **Cross-tenant access returns 404, not 403**, so application IDs cannot be
 probed for existence.
 
-**220 automated assertions** across the scoring engine, authorization model,
-PDF handling, AI behaviour, and live HTTP responses.
+**Over 470 automated assertions** across the scoring engine, authorization model,
+PDF handling, AI behaviour, the database (127 against a real PostgreSQL with RLS
+enforced) and live HTTP responses from the Cloudflare Worker.
 
 ---
 
 ## Architecture
 
 ```
-Next.js (App Router) ──► API routes / server components
+Cloudflare Worker (OpenNext) ──► Next.js App Router: API routes / server components
                               │
                 ┌─────────────┼─────────────┐
                 ▼             ▼             ▼
@@ -106,11 +109,11 @@ Next.js (App Router) ──► API routes / server components
 |---|---|---|
 | Framework | Next.js 15, React 19, TypeScript | Server components keep secrets server-side by construction |
 | Database | Neon PostgreSQL, serverless driver | Row-level security moves authorization below the API |
-| Object storage | Cloudflare R2, private bucket | Presigned direct upload sidesteps Vercel's 4.5 MB body cap; no egress fees |
+| Object storage | Cloudflare R2, private bucket (optional) | Presigned direct upload keeps PDF bytes off the Worker; only resume upload/viewing need it |
 | AI | Groq | Fast inference on a free tier; abstracted behind one service module |
 | Validation | Zod | Model output is schema-validated before it can reach the database |
 | Styling | Tailwind CSS | — |
-| Hosting | Vercel | — |
+| Hosting | Cloudflare Workers (Free) via `@opennextjs/cloudflare` | Static assets free and unlimited; passwords hashed by PostgreSQL so the Worker stays within its CPU budget |
 
 ### Project structure
 
@@ -128,43 +131,68 @@ lib/
                         embedded-select compiler, user/service clients
   storage/r2.ts         Cloudflare R2 via the S3-compatible API
   resume/pdf.ts         PDF validation and extraction
-db/migrations/          Schema (28 tables) and RLS policies
-scripts/                Seed script and test suites
+db/migrations/          Schema (29 tables), RLS policies, sign-in throttling
+cloudflare/worker.ts    Worker entry: the OpenNext app plus the daily queue-drain cron
+scripts/                Migrations, role setup, seed, test suites, local WebSocket proxy (dev/)
+wrangler.jsonc          Cloudflare Worker configuration (talentiq-demo)
 ```
 
 ---
 
 ## Running it yourself
 
-Requires free accounts with Neon, Cloudflare R2, Groq and Vercel.
+Requires Node.js 22 or later (CI uses 22; also tested with 24) and a PostgreSQL
+database: a free Neon project, or any local PostgreSQL 16+ through the bundled
+WebSocket proxy. Cloudflare (to deploy), Groq (AI) and R2 (resume PDFs) are
+optional. All demo data is fictional.
 
 ```bash
-npm install
+npm ci
+cp .dev.vars.example .dev.vars     # PowerShell: Copy-Item .dev.vars.example .dev.vars
 ```
 
-Copy `.env.example` to `.env.local` and fill in your own values, then apply the
-schema and provision the least-privilege application role:
+Fill in `.dev.vars` (git-ignored, never deployed). Keep secrets out of `.env*`
+files: the Cloudflare build copies those into the Worker, and `npm run cf:build`
+refuses to run if they contain any. Then apply the schema and provision the
+least-privilege application role:
 
 ```bash
-npm run db:migrate && npm run db:setup-role
+npm run db:migrate
+npm run db:setup-role
+npm run seed                       # optional fictional demo data (refuses databases with real accounts)
 ```
 
 `db:setup-role` matters: Neon's owner role carries `BYPASSRLS`, which switches
 off every RLS policy in the schema. The application must connect as `tip_app`.
-See [`DEPLOY.md`](./DEPLOY.md) section 0.
+See [`DEPLOY.md`](./DEPLOY.md) section 0. Migrations are recorded in a ledger,
+so `db:migrate` is safe to repeat.
 
-```bash
-npm test && npm run dev
-```
+| Command | What it does |
+|---|---|
+| `npm run dev` | Next.js dev server with `.dev.vars`, http://localhost:3000 |
+| `npm run cf:preview` | Build for Cloudflare and run the Worker in `workerd`, http://localhost:8787 |
+| `npm run cf:deploy` | Build and deploy the `talentiq-demo` Worker (see DEPLOY.md first) |
+| `npm test` | Static suites: scoring, authorization, PDF, AI, migration, embedded selects |
+| `npm run test:integration` | 127 checks against the configured PostgreSQL, as `tip_app` |
+| `BASE_URL=http://127.0.0.1:8787 npm run test:http` | 43 HTTP checks against a running server (bash) |
+| `npm run db:wsproxy` | WebSocket proxy so the Neon driver can reach a local PostgreSQL |
 
-Seeding, once the database is up (set `SEED_PASSWORD_CANDIDATE`,
-`SEED_PASSWORD_RECRUITER` and `SEED_PASSWORD_ADMIN` in `.env.local` first):
+**Demo accounts** (after `npm run seed`): `admin@demo.internal`,
+`recruiter@demo.internal`, `recruiter2@demo.internal` and
+`candidate@demo.internal` … `candidate5@demo.internal`. Their passwords are the
+`SEED_PASSWORD_*` values you chose. They are fictional, demo-only accounts.
 
-```bash
-npm run seed
-```
+**Known limitations**
 
-Full deployment walkthrough: [`DEPLOY.md`](./DEPLOY.md).
+- Resume PDF upload and viewing need Cloudflare R2, which is optional and has
+  not been tested against a real bucket. Without it they answer
+  "storage not configured"; seeded resumes are text-only.
+- AI analysis needs a Groq key; without one, analyses stay queued or fail with a
+  clear "not configured" error, and no scores are produced.
+- Workers Free allows 10 ms of CPU per request. Whether every Next.js page stays
+  within it can only be confirmed by a deployment, which has not been done.
+
+Full deployment walkthrough and troubleshooting: [`DEPLOY.md`](./DEPLOY.md).
 Honest scope notes, including what is *not* built: [`STATUS.md`](./STATUS.md).
 
 ---

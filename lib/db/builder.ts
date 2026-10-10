@@ -127,7 +127,7 @@ type Filter =
 interface OrderBy { column: string; ascending: boolean }
 
 export type Runner = <R>(
-  fn: (client: PoolClient) => Promise<R>,
+  fn: (client: Pick<PoolClient, 'query'>) => Promise<R>,
 ) => Promise<R>;
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

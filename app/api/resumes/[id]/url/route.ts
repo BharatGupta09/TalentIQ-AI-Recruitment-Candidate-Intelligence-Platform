@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { requireUser, errorResponse, AuthzError } from '@/lib/auth/guards';
 import { createClient } from '@/lib/db/server';
-import { presignDownload } from '@/lib/storage/r2';
+import { isR2Configured, presignDownload, R2_NOT_CONFIGURED } from '@/lib/storage/r2';
 
 export const runtime = 'nodejs';
 
@@ -29,6 +29,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
 
     if (!resume) throw new AuthzError(404, 'Resume not found.');
 
+    if (!isR2Configured()) return NextResponse.json({ error: R2_NOT_CONFIGURED }, { status: 503 });
     try {
       const url = await presignDownload(resume.storage_path, resume.file_name);
       return NextResponse.json({ url, fileName: resume.file_name });
